@@ -30,11 +30,13 @@ REPORTS_DIR = Path(__file__).parent / "reports"
 def _load_reportlab():
     """Import ReportLab, or raise a clear error if it isn't installed."""
     try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.units import mm
-        from reportlab.pdfgen import canvas
-        return colors, landscape(A4), mm, canvas
+        import importlib
+
+        colors = importlib.import_module("reportlab.lib.colors")
+        pagesizes = importlib.import_module("reportlab.lib.pagesizes")
+        units = importlib.import_module("reportlab.lib.units")
+        canvas = importlib.import_module("reportlab.pdfgen.canvas")
+        return colors, pagesizes.landscape(pagesizes.A4), units.mm, canvas.canvas
     except ImportError as error:
         raise RuntimeError(
             "ReportLab is not installed. Run:  pip install reportlab") from error
