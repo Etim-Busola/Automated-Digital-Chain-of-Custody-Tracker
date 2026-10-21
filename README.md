@@ -159,6 +159,11 @@ project copy when preserving an existing application's anchor history matters.
 The generated results describe the observed behavior of that run, including
 any limitations or unexpectedly successful attacks.
 
+
+##Dependencies
+-report lab
+-streamlit
+
 ## Current limitations
 
 - The terminal application accepts user IDs without authenticating the people
