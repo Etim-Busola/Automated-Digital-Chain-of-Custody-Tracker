@@ -36,7 +36,7 @@ def _load_reportlab():
         pagesizes = importlib.import_module("reportlab.lib.pagesizes")
         units = importlib.import_module("reportlab.lib.units")
         canvas = importlib.import_module("reportlab.pdfgen.canvas")
-        return colors, pagesizes.landscape(pagesizes.A4), units.mm, canvas.canvas
+        return colors, pagesizes.landscape(pagesizes.A4), units.mm, canvas
     except ImportError as error:
         raise RuntimeError(
             "ReportLab is not installed. Run:  pip install reportlab") from error
