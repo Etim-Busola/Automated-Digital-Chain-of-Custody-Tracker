@@ -13,25 +13,27 @@ Run it with:
 import sqlite3
 import sys
 from pathlib import Path
-
+import alerts
 import coc_hash_chain as chain
 import database
 import evidence
+import reporting
 import state_machine
 
 MENU = """
 ==================================================
   OCTA-CoC  -  Chain of Custody Tracker
 ==================================================
-  1. Register new evidence
-  2. Transfer custody
-  3. View case audit trail
-  4. Generate compliance report
-  5. Run threshold / alert check
-  6. Verify chain integrity
-  7. Add a user
-  8. Open a case
-  9. Load sample data (for a demo)
+  1. Add a user
+  2. Open a case
+  3. Register new evidence
+  4. Request custody transfer
+  5. Approve / reject a pending transfer
+  6. View case audit trail
+  7. Verify chain integrity
+  8. Run threshold / alert check
+  9. Generate compliance report
+ 10. Load sample data (for a demo)
   0. Exit
 """
 
@@ -49,15 +51,17 @@ def ask(question, required=True):
 # ---------------------------------------------------------------------------
 
 def action_register_evidence(conn):
-    """1. Register new evidence."""
+    """3. Register new evidence."""
     case_id = ask("Case ID")
-    evidence_id = ask("Evidence ID")
-    file_path = ask("Path to the evidence file")
+    file_path = ask("Path to the evidence file"
+                   f" (accepted: {', '.join(sorted(evidence.ALLOWED_EXTENSIONS))};"
+                   f" max {evidence.MAX_FILE_SIZE // (1024 * 1024)} MB)")
     custodian_id = ask("Your user ID (custodian)")
     location_id = ask("Storage location ID", required=False)
     evidence_type = ask("Evidence type (e.g. Disk image)", required=False)
     device_type = ask("Device type (e.g. Laptop)", required=False)
 
+    evidence_id = database.next_id(conn, "Evidence", "EvidenceID", "EV-")
     fingerprint = evidence.register_evidence(
         conn, case_id, evidence_id, file_path, custodian_id,
         location_id=location_id, evidence_type=evidence_type,
@@ -69,7 +73,7 @@ def action_register_evidence(conn):
 
 
 def action_transfer_custody(conn):
-    """2. Transfer custody."""
+    """4. Request a custody transfer."""
     evidence_id = ask("Evidence ID")
     state, custodian = evidence.current_status(conn, evidence_id)
     allowed = state_machine.allowed_next_states(state)
@@ -85,13 +89,14 @@ def action_transfer_custody(conn):
     to_user_id = ask("Receiving custodian ID")
     reason = ask("Reason for the transfer", required=False)
 
-    state_machine.transfer_custody(conn, evidence_id, new_state,
+    state_machine.request_transfer(conn, evidence_id, new_state,
                                    from_user_id, to_user_id, reason=reason)
-    print(f"\n  {evidence_id} is now '{new_state}', held by {to_user_id}")
+    print(f"\n  Requested: {evidence_id} -> '{new_state}'."
+         f" Waiting for {to_user_id} to approve (option 5).")
 
 
 def action_view_audit_trail(conn):
-    """3. View case audit trail."""
+    """6. View case audit trail."""
     case_id = ask("Case ID")
     entries = chain.get_chain(conn, case_id)
     if not entries:
@@ -108,17 +113,35 @@ def action_view_audit_trail(conn):
 
 
 def action_generate_report(conn):
-    """4. Generate compliance report."""
-    print("\n  The PDF report is built in Phase 7 and is not available yet.\n")
+    """9. Generate compliance report."""
+    case_id = ask("Case ID")
+    report_path = reporting.generate_report(conn, case_id)
+    print(f"\n  Report written to: {report_path}")
+    print("  Its fingerprint has been recorded in the case's audit trail.\n")
 
 
 def action_check_alerts(conn):
-    """5. Run threshold / alert check."""
-    print("\n  Threshold alerts are built in Phase 6 and are not available yet.\n")
+    """8. Run threshold / alert check."""
+    hours_text = ask(f"Hours limit (blank for {alerts.DEFAULT_HOURS_LIMIT})",
+                     required=False)
+    hours_limit = int(hours_text) if hours_text else alerts.DEFAULT_HOURS_LIMIT
+
+    overdue = alerts.check_thresholds(conn, hours_limit=hours_limit)
+    if not overdue:
+        print(f"\n  Nothing is overdue. No item has been '{alerts.WATCHED_STATE}'"
+              f" for more than {hours_limit} hours.\n")
+        return
+
+    print(f"\n  {len(overdue)} item(s) have been '{alerts.WATCHED_STATE}'"
+          f" for more than {hours_limit} hours:\n")
+    for row in overdue:
+        print(f"    {row['EvidenceID']}  (case {row['CaseID']})")
+        print(f"      held by {row['Custodian']}, in transit since"
+              f" {row['InTransitSince']}  -  {row['HoursElapsed']} hours\n")
 
 
 def action_verify_chain(conn):
-    """6. Verify chain integrity."""
+    """7. Verify chain integrity."""
     case_id = ask("Case ID")
     chain_ok, chain_message = chain.verify_chain(conn, case_id)
     anchor_ok, anchor_message = chain.verify_against_anchor(conn, case_id)
@@ -127,18 +150,14 @@ def action_verify_chain(conn):
 
 
 def action_add_user(conn):
-    """7. Add a user."""
-    user_id = ask("User ID")
+    """1. Add a user."""
     full_name = ask("Full name")
     role = ask("Role (e.g. Investigator, Analyst, Evidence Custodian)")
     email = ask("Email", required=False)
     dept = ask("Department", required=False)
     phone = ask("Phone number", required=False)
 
-    if conn.execute('SELECT UserID FROM "User" WHERE UserID = ?',
-                    (user_id,)).fetchone() is not None:
-        raise ValueError(f"User '{user_id}' already exists")
-
+    user_id = database.next_id(conn, "User", "UserID", "U", width=0)
     conn.execute('INSERT INTO "User" (UserID, FullName, Email, Role, Dept, PhoneNo,'
                  ' Status) VALUES (?, ?, ?, ?, ?, ?, ?)',
                  (user_id, full_name, email, role, dept, phone, "Active"))
@@ -147,21 +166,18 @@ def action_add_user(conn):
 
 
 def action_open_case(conn):
-    """8. Open a case."""
-    case_id = ask("Case ID")
+    """2. Open a case."""
     title = ask("Case title")
     owner_id = ask("Lead investigator's user ID")
     case_number = ask("Case number", required=False)
     investigation_type = ask("Investigation type", required=False)
     description = ask("Description", required=False)
 
-    if conn.execute('SELECT CaseID FROM "Case" WHERE CaseID = ?',
-                    (case_id,)).fetchone() is not None:
-        raise ValueError(f"Case '{case_id}' already exists")
     if conn.execute('SELECT UserID FROM "User" WHERE UserID = ?',
                     (owner_id,)).fetchone() is None:
         raise ValueError(f"User '{owner_id}' does not exist - add the user first")
 
+    case_id = database.next_id(conn, "Case", "CaseID", "CASE-")
     opened_at = chain.now_utc()
     conn.execute('INSERT INTO "Case" (CaseID, UserID, CaseTitle, CaseNumber,'
                  ' CaseDescription, InvestigationType, DateOpened, Status)'
@@ -174,7 +190,7 @@ def action_open_case(conn):
 
 
 def action_load_sample_data(conn):
-    """9. Load sample data, so a demo can start straight away."""
+    """10. Load sample data, so a demo can start straight away."""
     users = [("U1", "Officer A", "Investigator"),
              ("U2", "Officer B", "Analyst"),
              ("U3", "Officer C", "Evidence Custodian")]
@@ -201,19 +217,48 @@ def action_load_sample_data(conn):
         print(f"    {user_id}  {name}  ({role})")
     print("    LOC-01  Evidence Room")
     print(f"    {sample_file}")
-    print("\n  Next: open a case (8), then register evidence (1).\n")
+    print("\n  Next: open a case (2), then register evidence (3).\n")
+
+
+def action_approve_reject_transfer(conn):
+    """5. Approve or reject a pending transfer."""
+    user_id = ask("Your user ID")
+    pending = state_machine.list_pending_for_user(conn, user_id)
+    if not pending:
+        print(f"\n  Nothing is waiting for {user_id}'s approval.\n")
+        return
+
+    print(f"\n  Pending transfers for {user_id}:\n")
+    for row in pending:
+        print(f"    #{row['PendingID']}  {row['EvidenceID']}  {row['FromUserID']} -> {user_id}"
+             f"  ->  {row['NewState']}   (requested {row['RequestedAt']})")
+        if row["Reason"]:
+            print(f"        reason: {row['Reason']}")
+    print()
+
+    pending_id = int(ask("Pending transfer # to act on"))
+    decision = ask("Approve or reject? (a/r)")
+
+    if decision.lower().startswith("a"):
+        new_state = state_machine.approve_transfer(conn, pending_id, user_id)
+        print(f"\n  Approved - item is now '{new_state}'\n")
+    else:
+        reject_reason = ask("Reason for rejecting", required=False)
+        state_machine.reject_transfer(conn, pending_id, user_id, reason=reject_reason)
+        print("\n  Rejected.\n")
 
 
 ACTIONS = {
-    "1": action_register_evidence,
-    "2": action_transfer_custody,
-    "3": action_view_audit_trail,
-    "4": action_generate_report,
-    "5": action_check_alerts,
-    "6": action_verify_chain,
-    "7": action_add_user,
-    "8": action_open_case,
-    "9": action_load_sample_data,
+    "1": action_add_user,
+    "2": action_open_case,
+    "3": action_register_evidence,
+    "4": action_transfer_custody,
+    "5": action_approve_reject_transfer,
+    "6": action_view_audit_trail,
+    "7": action_verify_chain,
+    "8": action_check_alerts,
+    "9": action_generate_report,
+    "10": action_load_sample_data,
 }
 
 
