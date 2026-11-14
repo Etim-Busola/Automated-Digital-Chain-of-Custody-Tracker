@@ -22,14 +22,15 @@ import state_machine
 st.set_page_config(page_title="OCTA-CoC", layout="wide")
 
 PAGES = [
-    "Register new evidence",
-    "Transfer custody",
-    "View case audit trail",
-    "Generate compliance report",
-    "Run threshold / alert check",
-    "Verify chain integrity",
     "Add a user",
     "Open a case",
+    "Register new evidence",
+    "Request custody transfer",
+    "Approve / reject transfers",
+    "View case audit trail",
+    "Verify chain integrity",
+    "Run threshold / alert check",
+    "Generate compliance report",
     "Load sample data",
     "Run pentest",
 ]
@@ -48,10 +49,13 @@ def save_upload(uploaded_file):
 
 def page_register_evidence(conn):
     st.header("Register new evidence")
+    max_mb = evidence.MAX_FILE_SIZE // (1024 * 1024)
+    st.caption(f"Accepted file types: {', '.join(sorted(evidence.ALLOWED_EXTENSIONS))}."
+              f" Maximum size: {max_mb} MB.")
     with st.form("register_evidence"):
         case_id = st.text_input("Case ID")
-        evidence_id = st.text_input("Evidence ID")
-        uploaded_file = st.file_uploader("Evidence file")
+        uploaded_file = st.file_uploader(
+            "Evidence file", type=sorted(evidence.ALLOWED_EXTENSIONS))
         custodian_id = st.text_input("Your user ID (custodian)")
         location_id = st.text_input("Storage location ID (optional)")
         evidence_type = st.text_input("Evidence type, e.g. Disk image (optional)")
@@ -63,8 +67,13 @@ def page_register_evidence(conn):
     if not uploaded_file:
         st.error("Choose an evidence file first")
         return
+    if uploaded_file.size > evidence.MAX_FILE_SIZE:
+        st.error(f"File is too large ({uploaded_file.size / (1024 * 1024):.1f} MB)."
+                f" Maximum is {max_mb} MB")
+        return
     try:
         file_path = save_upload(uploaded_file)
+        evidence_id = database.next_id(conn, "Evidence", "EvidenceID", "EV-")
         fingerprint = evidence.register_evidence(
             conn, case_id, evidence_id, file_path, custodian_id,
             location_id=location_id or None, evidence_type=evidence_type or None,
@@ -77,7 +86,9 @@ def page_register_evidence(conn):
 
 
 def page_transfer_custody(conn):
-    st.header("Transfer custody")
+    st.header("Request custody transfer")
+    st.caption("This sends a request - the receiving custodian has to approve it"
+              " (see 'Approve / reject transfers') before the item actually moves.")
     evidence_id = st.text_input("Evidence ID")
     if not evidence_id:
         return
@@ -100,16 +111,54 @@ def page_transfer_custody(conn):
         from_user_id = st.text_input("Releasing custodian ID")
         to_user_id = st.text_input("Receiving custodian ID")
         reason = st.text_input("Reason for the transfer (optional)")
-        submitted = st.form_submit_button("Transfer")
+        submitted = st.form_submit_button("Request transfer")
 
     if submitted:
         try:
-            state_machine.transfer_custody(conn, evidence_id, new_state,
+            state_machine.request_transfer(conn, evidence_id, new_state,
                                            from_user_id, to_user_id,
                                            reason=reason or None)
-            st.success(f"{evidence_id} is now '{new_state}', held by {to_user_id}")
+            st.success(f"Requested: {evidence_id} -> '{new_state}'."
+                      f" Waiting for {to_user_id} to approve.")
         except (ValueError, RuntimeError) as error:
             st.error(str(error))
+
+
+def page_approve_reject_transfers(conn):
+    st.header("Approve / reject transfers")
+    user_id = st.text_input("Your user ID")
+    if not user_id:
+        return
+
+    pending = state_machine.list_pending_for_user(conn, user_id)
+    if not pending:
+        st.info(f"Nothing is waiting for {user_id}'s approval.")
+        return
+
+    for row in pending:
+        with st.container(border=True):
+            st.write(f"**#{row['PendingID']}** - {row['EvidenceID']}:"
+                    f" {row['FromUserID']} wants to hand off to you, moving it to"
+                    f" **{row['NewState']}**")
+            if row["Reason"]:
+                st.caption(f"Reason: {row['Reason']}")
+            st.caption(f"Requested: {row['RequestedAt']}")
+
+            approve_col, reject_col = st.columns(2)
+            if approve_col.button("Approve", key=f"approve_{row['PendingID']}"):
+                try:
+                    new_state = state_machine.approve_transfer(conn, row["PendingID"], user_id)
+                    st.success(f"Approved - {row['EvidenceID']} is now '{new_state}'")
+                    st.rerun()
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
+            if reject_col.button("Reject", key=f"reject_{row['PendingID']}"):
+                try:
+                    state_machine.reject_transfer(conn, row["PendingID"], user_id)
+                    st.warning(f"Rejected the transfer for {row['EvidenceID']}")
+                    st.rerun()
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
 
 
 def page_view_audit_trail(conn):
@@ -183,7 +232,6 @@ def page_verify_chain(conn):
 def page_add_user(conn):
     st.header("Add a user")
     with st.form("add_user"):
-        user_id = st.text_input("User ID")
         full_name = st.text_input("Full name")
         role = st.text_input("Role, e.g. Investigator, Analyst, Evidence Custodian")
         email = st.text_input("Email (optional)")
@@ -194,9 +242,7 @@ def page_add_user(conn):
     if not submitted:
         return
     try:
-        if conn.execute('SELECT UserID FROM "User" WHERE UserID = ?',
-                        (user_id,)).fetchone() is not None:
-            raise ValueError(f"User '{user_id}' already exists")
+        user_id = database.next_id(conn, "User", "UserID", "U", width=0)
         conn.execute('INSERT INTO "User" (UserID, FullName, Email, Role, Dept, PhoneNo,'
                      ' Status) VALUES (?, ?, ?, ?, ?, ?, ?)',
                      (user_id, full_name, email or None, role, dept or None,
@@ -210,7 +256,6 @@ def page_add_user(conn):
 def page_open_case(conn):
     st.header("Open a case")
     with st.form("open_case"):
-        case_id = st.text_input("Case ID")
         title = st.text_input("Case title")
         owner_id = st.text_input("Lead investigator's user ID")
         case_number = st.text_input("Case number (optional)")
@@ -221,13 +266,11 @@ def page_open_case(conn):
     if not submitted:
         return
     try:
-        if conn.execute('SELECT CaseID FROM "Case" WHERE CaseID = ?',
-                        (case_id,)).fetchone() is not None:
-            raise ValueError(f"Case '{case_id}' already exists")
         if conn.execute('SELECT UserID FROM "User" WHERE UserID = ?',
                         (owner_id,)).fetchone() is None:
             raise ValueError(f"User '{owner_id}' does not exist - add the user first")
 
+        case_id = database.next_id(conn, "Case", "CaseID", "CASE-")
         opened_at = chain.now_utc()
         conn.execute('INSERT INTO "Case" (CaseID, UserID, CaseTitle, CaseNumber,'
                      ' CaseDescription, InvestigationType, DateOpened, Status)'
@@ -297,14 +340,15 @@ def page_run_pentest():
 
 
 PAGE_FUNCTIONS = {
-    "Register new evidence": page_register_evidence,
-    "Transfer custody": page_transfer_custody,
-    "View case audit trail": page_view_audit_trail,
-    "Generate compliance report": page_generate_report,
-    "Run threshold / alert check": page_check_alerts,
-    "Verify chain integrity": page_verify_chain,
     "Add a user": page_add_user,
     "Open a case": page_open_case,
+    "Register new evidence": page_register_evidence,
+    "Request custody transfer": page_transfer_custody,
+    "Approve / reject transfers": page_approve_reject_transfers,
+    "View case audit trail": page_view_audit_trail,
+    "Verify chain integrity": page_verify_chain,
+    "Run threshold / alert check": page_check_alerts,
+    "Generate compliance report": page_generate_report,
     "Load sample data": page_load_sample_data,
 }
 
