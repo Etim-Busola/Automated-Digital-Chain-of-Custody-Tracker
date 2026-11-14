@@ -22,6 +22,17 @@ import database
 
 FIRST_STATE = "Logged"
 
+# What's accepted as an evidence file, and how big it may be.
+ALLOWED_EXTENSIONS = {
+    "jpg", "jpeg", "png", "gif",     # photos
+    "pdf", "doc", "docx", "txt",     # documents
+    "img", "dd", "e01", "raw",       # disk / forensic images
+    "mp4", "mov", "avi",             # video
+    "mp3", "wav",                    # audio
+    "zip",                           # archives
+}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
 
 def register_evidence(conn, case_id, evidence_id, file_path, custodian_id,
                       location_id=None, evidence_type=None, device_type=None,
@@ -29,6 +40,22 @@ def register_evidence(conn, case_id, evidence_id, file_path, custodian_id,
                       anchor_file=chain.ANCHOR_FILE):
     """Book one evidence item in. Returns its fingerprint."""
     evidence_file = Path(file_path)
+
+    try:
+        file_size = evidence_file.stat().st_size
+    except OSError as error:
+        raise ValueError(f"File not found: {evidence_file}") from error
+
+    file_format = evidence_file.suffix.lstrip(".").lower()
+    if file_format not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            f"'.{file_format}' is not an accepted evidence file type. Accepted:"
+            f" {', '.join(sorted(ALLOWED_EXTENSIONS))}")
+
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(
+            f"File is too large ({file_size / (1024 * 1024):.1f} MB)."
+            f" Maximum is {MAX_FILE_SIZE // (1024 * 1024)} MB")
 
     case = conn.execute('SELECT CaseID FROM "Case" WHERE CaseID = ?',
                         (case_id,)).fetchone()
@@ -46,8 +73,6 @@ def register_evidence(conn, case_id, evidence_id, file_path, custodian_id,
         raise ValueError(f"Evidence '{evidence_id}' is already registered")
 
     hash_value = chain.hash_file(evidence_file)          # fingerprint the file
-    file_size = evidence_file.stat().st_size
-    file_format = evidence_file.suffix.lstrip(".") or None
     collected_at = chain.now_utc()
 
     try:
