@@ -88,6 +88,17 @@ CREATE TABLE IF NOT EXISTS CustodyRecord (
     VerificationStatus  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS PendingTransfer (
+    PendingID     INTEGER PRIMARY KEY AUTOINCREMENT,
+    EvidenceID    TEXT NOT NULL REFERENCES Evidence(EvidenceID),
+    FromUserID    TEXT NOT NULL REFERENCES "User"(UserID),
+    ToUserID      TEXT NOT NULL REFERENCES "User"(UserID),
+    NewState      TEXT NOT NULL,
+    Reason        TEXT,
+    RequestedAt   TEXT NOT NULL,
+    Status        TEXT NOT NULL DEFAULT 'Pending'  -- Pending, Approved, Rejected
+);
+
 CREATE TABLE IF NOT EXISTS AuditLog (
     LogID              INTEGER PRIMARY KEY AUTOINCREMENT,
     CaseID             TEXT NOT NULL REFERENCES "Case"(CaseID),
@@ -137,10 +148,30 @@ def get_connection(db_file=DB_FILE):
         conn = sqlite3.connect(db_file)
         conn.row_factory = sqlite3.Row          # rows behave like dictionaries
         conn.execute("PRAGMA foreign_keys = ON")
+        # INSERT OR REPLACE quietly deletes the old row before re-inserting it.
+        # Without this, that internal delete does not fire our DELETE triggers,
+        # which would let someone overwrite a CustodyRecord or AuditLog row.
+        conn.execute("PRAGMA recursive_triggers = ON")
         conn.executescript(SCHEMA)
         return conn
     except sqlite3.Error as error:
         raise RuntimeError(f"Could not open database '{db_file}': {error}") from error
+
+
+def next_id(conn, table, id_column, prefix, width=3):
+    """Return the next sequential ID, e.g. next_id(conn, "Case", "CaseID", "CASE-")
+    looks at the existing CaseIDs and returns 'CASE-004' if the highest one so
+    far was 'CASE-003'. Starts at 1 if the table has none yet.
+    """
+    highest = 0
+    for row in conn.execute(f'SELECT "{id_column}" FROM "{table}"').fetchall():
+        existing = row[id_column]
+        if existing and existing.startswith(prefix):
+            suffix = existing[len(prefix):]
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+    number = str(highest + 1).zfill(width) if width else str(highest + 1)
+    return f"{prefix}{number}"
 
 
 def demo_worm_protection():
