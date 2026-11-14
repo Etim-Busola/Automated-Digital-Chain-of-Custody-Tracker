@@ -96,6 +96,119 @@ def transfer_custody(conn, evidence_id, new_state, from_user_id, to_user_id,
     return new_state
 
 
+def request_transfer(conn, evidence_id, new_state, from_user_id, to_user_id,
+                     reason=None, anchor_file=chain.ANCHOR_FILE):
+    """Ask for a custody transfer. Returns the new PendingTransfer's id.
+
+    This runs the same checks as transfer_custody(), but instead of moving
+    the item immediately, it waits for the receiving custodian to approve
+    or reject it (see approve_transfer / reject_transfer below).
+    """
+    item = evidence.get_evidence(conn, evidence_id)      # raises if unknown
+    case_id = item["CaseID"]
+    state, custodian = evidence.current_status(conn, evidence_id)
+
+    def refuse(message):
+        record_rejected_attempt(conn, case_id, from_user_id, evidence_id,
+                                message, anchor_file)
+        raise ValueError(message)
+
+    already_pending = conn.execute(
+        "SELECT PendingID FROM PendingTransfer WHERE EvidenceID = ? AND Status = 'Pending'",
+        (evidence_id,)).fetchone()
+    if already_pending is not None:
+        refuse(f"A transfer for '{evidence_id}' is already pending approval")
+
+    if new_state not in TRANSITIONS:
+        refuse(f"'{new_state}' is not a known state")
+
+    if not from_user_id or not to_user_id:
+        refuse("Two custodian IDs are required (dual authorisation)")
+
+    if from_user_id == to_user_id:
+        refuse("The two custodian IDs must be different people")
+
+    for user_id in (from_user_id, to_user_id):
+        if conn.execute('SELECT UserID FROM "User" WHERE UserID = ?',
+                        (user_id,)).fetchone() is None:
+            refuse(f"User '{user_id}' does not exist")
+
+    if new_state not in allowed_next_states(state):
+        allowed = ", ".join(allowed_next_states(state)) or "nothing - this state is final"
+        refuse(f"'{state}' cannot move to '{new_state}'. Allowed: {allowed}")
+
+    if custodian is not None and from_user_id != custodian:
+        refuse(f"'{from_user_id}' does not hold this item - '{custodian}' does")
+
+    requested_at = chain.now_utc()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO PendingTransfer (EvidenceID, FromUserID, ToUserID, NewState,"
+            " Reason, RequestedAt, Status) VALUES (?, ?, ?, ?, ?, ?, 'Pending')",
+            (evidence_id, from_user_id, to_user_id, new_state, reason, requested_at))
+        conn.commit()
+    except sqlite3.Error as error:
+        raise RuntimeError(f"Could not save the pending transfer: {error}") from error
+
+    chain.add_entry(conn, case_id, f"Transfer requested: {state} -> {new_state}",
+                    from_user_id, evidence_id, result="Pending", anchor_file=anchor_file)
+    return cursor.lastrowid
+
+
+def get_pending_transfer(conn, pending_id):
+    """Return one pending transfer row, or raise if it does not exist."""
+    row = conn.execute("SELECT * FROM PendingTransfer WHERE PendingID = ?",
+                       (pending_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"Pending transfer #{pending_id} does not exist")
+    return row
+
+
+def list_pending_for_user(conn, user_id):
+    """Return every pending transfer request awaiting this user's approval."""
+    return conn.execute(
+        "SELECT * FROM PendingTransfer WHERE ToUserID = ? AND Status = 'Pending'"
+        " ORDER BY RequestedAt", (user_id,)).fetchall()
+
+
+def approve_transfer(conn, pending_id, approving_user_id, anchor_file=chain.ANCHOR_FILE):
+    """The receiving custodian accepts a pending transfer. Returns the new state."""
+    pending = get_pending_transfer(conn, pending_id)
+    if pending["Status"] != "Pending":
+        raise ValueError(f"Pending transfer #{pending_id} is already {pending['Status'].lower()}")
+    if approving_user_id != pending["ToUserID"]:
+        raise ValueError(f"Only '{pending['ToUserID']}' can approve this transfer")
+
+    new_state = transfer_custody(conn, pending["EvidenceID"], pending["NewState"],
+                                 pending["FromUserID"], pending["ToUserID"],
+                                 reason=pending["Reason"], anchor_file=anchor_file)
+    conn.execute("UPDATE PendingTransfer SET Status = 'Approved' WHERE PendingID = ?",
+                (pending_id,))
+    conn.commit()
+    return new_state
+
+
+def reject_transfer(conn, pending_id, rejecting_user_id, reason=None,
+                    anchor_file=chain.ANCHOR_FILE):
+    """The receiving custodian declines a pending transfer. The item does not move."""
+    pending = get_pending_transfer(conn, pending_id)
+    if pending["Status"] != "Pending":
+        raise ValueError(f"Pending transfer #{pending_id} is already {pending['Status'].lower()}")
+    if rejecting_user_id != pending["ToUserID"]:
+        raise ValueError(f"Only '{pending['ToUserID']}' can reject this transfer")
+
+    conn.execute("UPDATE PendingTransfer SET Status = 'Rejected' WHERE PendingID = ?",
+                (pending_id,))
+    conn.commit()
+
+    case_id = evidence.get_evidence(conn, pending["EvidenceID"])["CaseID"]
+    detail = f"Transfer request to {pending['NewState']} rejected"
+    if reason:
+        detail += f": {reason}"
+    chain.add_entry(conn, case_id, detail, rejecting_user_id, pending["EvidenceID"],
+                    result="Rejected", anchor_file=anchor_file)
+
+
 def custody_history(conn, evidence_id):
     """Return every handover of one item, oldest first."""
     return conn.execute("SELECT * FROM CustodyRecord WHERE EvidenceID = ?"
